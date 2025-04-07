@@ -4,8 +4,16 @@ from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
 from datetime import datetime
 import markdown
+import requests
+import logging
 
 app = Flask(__name__)
+
+# 配置日志
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 
 # 配置
 app.config['SQLALCHEMY_DATABASE_URI'] = \
@@ -272,16 +280,56 @@ def uploaded_file(filename):
     """提供上传的文件"""
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
 
+@app.route('/api/commands/call-dify-agent', methods=['POST'])
+def call_dify_agent():
+    try:
+        # 获取请求数据
+        data = request.get_json()
+        app.logger.debug(f"Received raw request data: {data}")
+        command_id = data.get('command_id')
+        two_dimensional_file = data.get('two_dimensional_file')  # 直接获取文件内容
+
+        app.logger.debug(f"Received request with Command_id: {command_id}, Two_Dimensional_File: {two_dimensional_file}")
+
+        # 检查必要参数是否存在
+        if not all([command_id, two_dimensional_file]):
+            return jsonify({"error": "Missing required parameters"}), 400
+
+        # 调用 Dify 智能体 API
+        dify_url = 'http://192.168.9.177/v1/chat-messages'
+        headers = {
+            'Authorization': 'Bearer app-DW501jMNgfhIHa4tvZrFSMJY',
+            'Content-Type': 'application/json'
+        }
+        payload = {
+            "inputs": {
+                "Command_id": command_id,
+                "Two_Dimensional_File": two_dimensional_file  # 直接传递文件内容
+            },
+            "query": "请基于二维表生成" + command_id + "的检证用例",
+            "response_mode": "streaming",
+            "conversation_id": "",
+            "user": "abc-123",
+            "files": [],
+            "parent_message_id": None
+        }
+
+        try:
+            app.logger.debug(f"Calling Dify API with payload: {payload}")
+            response = requests.post(dify_url, json=payload, headers=headers)
+            response.raise_for_status()
+            app.logger.debug(f"Dify API response: {response.text}")
+            return jsonify(response.json()), 200
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"Dify API request failed: {str(e)}")
+            return jsonify({"error": f"Dify API request failed: {str(e)}"}), 500
+
+    except Exception as e:
+        app.logger.error(f"Failed to call Dify agent: {str(e)}")
+        return jsonify({"error": f"Failed to call Dify agent: {str(e)}"}), 500
+
 if __name__ == '__main__':
     with app.app_context():
         db.create_all()
-        try:
-            db.session.execute(
-                text("CREATE SEQUENCE CommandSequence START WITH 1 INCREMENT BY 1")
-            )
-            db.session.commit()
-        except Exception as e:
-            db.session.rollback()
-            app.logger.warning(f"Sequence already exists: {str(e)}")
     
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    app.run(host='0.0.0.0', port=5500, debug=True)

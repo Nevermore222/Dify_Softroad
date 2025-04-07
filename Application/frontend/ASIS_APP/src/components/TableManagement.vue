@@ -128,6 +128,16 @@
                     <el-tag v-if="fileStatus[file.path]" :type="fileStatus[file.path].type" size="small">
                       {{ fileStatus[file.path].text }}
                     </el-tag>
+                    <el-button 
+                      type="primary" 
+                      size="small" 
+                      @click.stop="callDifyAgent(row, file.path)"
+                      :loading="callingAgent"
+                      style="margin-left: 10px;"
+                    >
+                      <el-icon><MagicStick /></el-icon>
+                      <span>调用智能体</span>
+                    </el-button>
                   </div>
 
                   <div class="file-editor-container" v-if="showFileEditor && currentFile?.path === file.path">
@@ -261,7 +271,7 @@ import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { 
   Search, Plus, Document, Delete, View, 
-  Upload, InfoFilled, ArrowRight, Refresh 
+  Upload, InfoFilled, ArrowRight, Refresh, MagicStick 
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import hljs from 'highlight.js'
@@ -288,6 +298,7 @@ const lastSavedTime = ref(null)
 const unsavedChanges = ref(false)
 const fileStatus = ref({})
 const currentFile = ref(null)
+const callingAgent = ref(false)
 
 // 数据相关
 const commandList = ref([])
@@ -637,6 +648,33 @@ const formatDateTime = (isoString) => {
     second: '2-digit',
     hour12: false
   })
+}
+
+const callDifyAgent = async (row, filePath) => {
+  try {
+    callingAgent.value = true
+    
+    // 获取文件内容
+    const fileRes = await axios.get('/api/files/content', {
+      params: { path: filePath }
+    });
+    
+    // 调用后端代理接口，传递文件内容
+    const res = await axios.post('/api/commands/call-dify-agent', {
+      command_id: row.command_value,
+      two_dimensional_file: fileRes.data.content // 传递文件内容
+    });
+    
+    // 处理返回结果
+    ElMessage.success('智能体调用成功')
+    console.log('Dify智能体返回结果:', res.data)
+    
+  } catch (error) {
+    ElMessage.error('调用智能体失败: ' + error.message)
+    console.error('调用智能体失败:', error)
+  } finally {
+    callingAgent.value = false
+  }
 }
 
 // 初始化加载
