@@ -67,6 +67,7 @@
         stripe
         highlight-current-row
         @row-click="handleRowClick"
+        @row-contextmenu="(e, row) => e.preventDefault()"
         style="width: 100%"
       >
         <el-table-column prop="command_type" label="类型" width="120" align="center">
@@ -77,10 +78,13 @@
           </template>
         </el-table-column>
         <el-table-column prop="command_value" label="命令内容" min-width="200" show-overflow-tooltip />
-        <el-table-column prop="table_data_path" label="表格文件" width="250" show-overflow-tooltip>
+        <el-table-column prop="out_folder_path" label="存储目录" width="350">
           <template #default="{ row }">
-            <el-link type="primary" @click.stop="previewFile(row.table_data_path)">
-              {{ getFileName(row.table_data_path) }}
+            <el-link 
+              type="primary" 
+              @click.stop="previewFolder(row.out_folder_path)"
+            >
+              {{ row.out_folder_path }}
             </el-link>
           </template>
         </el-table-column>
@@ -105,7 +109,7 @@
         </el-table-column>
 
         <!-- 展开行显示文件内容 -->
-        <el-table-column type="expand" width="60">
+        <el-table-column type="expand">
           <template #default="{ row }">
             <div class="file-content-section">
               <div class="path-list-header">
@@ -119,19 +123,31 @@
                   :key="index"
                   class="path-item"
                 >
-                  <div class="path-header" @click="toggleFileEditor(row, file.path)">
-                    <el-icon :class="{'rotate-icon': showFileEditor && currentFile?.path === file.path}">
+                  <div class="path-header">
+                    <el-icon :class="{'rotate-icon': showFileEditor && currentFile?.path === file.full_path}">
                       <ArrowRight />
                     </el-icon>
-                    <span class="path-text">{{ file.path }}</span>
+                    <el-link 
+                      type="primary" 
+                      @click.stop="() => file.full_path && toggleFileEditor(row, file.full_path)"
+                      style="margin-left: 20px;"
+                    >
+                      {{ file.file_name }}
+                    </el-link>
                     <span class="file-time">{{ formatDateTime(file.created_at) }}</span>
-                    <el-tag v-if="fileStatus[file.path]" :type="fileStatus[file.path].type" size="small">
-                      {{ fileStatus[file.path].text }}
-                    </el-tag>
+                    <el-button 
+                      type="info" 
+                      size="small" 
+                      @click.stop="previewMarkdown(file.full_path)"
+                      style="margin-left: 10px;"
+                    >
+                      <el-icon><View /></el-icon>
+                      <span>预览</span>
+                    </el-button>
                     <el-button 
                       type="primary" 
                       size="small" 
-                      @click.stop="callDifyAgent(row, file.path)"
+                      @click.stop="() => file.full_path && callDifyAgent(row, file.full_path)"
                       :loading="callingAgent"
                       style="margin-left: 10px;"
                     >
@@ -140,7 +156,8 @@
                     </el-button>
                   </div>
 
-                  <div class="file-editor-container" v-if="showFileEditor && currentFile?.path === file.path">
+                  <div class="file-editor-container" v-if="showFileEditor && currentFile?.path === file.full_path">
+                    <!-- 保留原有的编辑器布局 -->
                     <div class="editor-area">
                       <el-input
                         v-model="fileContent"
@@ -167,14 +184,14 @@
                     <div class="editor-actions">
                       <el-button 
                         type="primary" 
-                        @click="saveFileContent(row, file.path)"
+                        @click="saveFileContent(row, file.full_path)"
                         :loading="savingFile"
                         :disabled="!unsavedChanges"
                       >
                         <el-icon><Upload /></el-icon>
                         <span>保存更改</span>
                       </el-button>
-                      <el-button @click="reloadFileContent(file.path)">
+                      <el-button @click="reloadFileContent(file.full_path)">
                         <el-icon><Refresh /></el-icon>
                         <span>重新加载</span>
                       </el-button>
@@ -271,10 +288,11 @@ import axios from 'axios'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { 
   Search, Plus, Document, Delete, View, 
-  Upload, InfoFilled, ArrowRight, Refresh, MagicStick 
+  Upload, InfoFilled, ArrowRight, Refresh, MagicStick, Files 
 } from '@element-plus/icons-vue'
 import { marked } from 'marked'
 import hljs from 'highlight.js'
+import dayjs from 'dayjs'
 
 // 配置marked
 marked.setOptions({
@@ -299,6 +317,7 @@ const unsavedChanges = ref(false)
 const fileStatus = ref({})
 const currentFile = ref(null)
 const callingAgent = ref(false)
+const currentCallingFile = ref(null)
 
 // 数据相关
 const commandList = ref([])
@@ -356,7 +375,10 @@ const compiledMarkdown = computed(() => {
   return marked(fileContent.value || '')
 })
 
-// 方法定义
+// 在setup()中添加
+const folderFiles = ref({})
+
+// 获取命令列表
 const fetchCommandList = async () => {
   try {
     loading.value = true
@@ -374,14 +396,16 @@ const fetchCommandList = async () => {
 
     const res = await axios.get('/api/commands', { params })
     
-    // 获取每个命令的所有文件路径
+    // 修复1：确保获取文件路径时包含full_path字段
     const commandsWithFiles = await Promise.all(
       res.data.data.map(async command => {
         const filesRes = await axios.get(`/api/commands/${encodeURIComponent(command.command_value)}/files`)
         return {
           ...command,
           file_paths: filesRes.data.files.map(file => ({
-            path: file.table_data_path,
+            full_path: file.full_path,  // 确保包含该字段
+            path: file.full_path,       // 兼容旧字段
+            file_name: file.file_name,
             created_at: file.created_at
           }))
         }
@@ -397,18 +421,41 @@ const fetchCommandList = async () => {
   }
 }
 
-const handleSearch = () => {
-  pagination.current_page = 1
-  fetchCommandList()
+// 新增文件夹预览方法
+const previewFolder = (folderPath) => {
+  if (!folderPath) return
+  const encodedPath = encodeURIComponent(folderPath.replace(/\\/g, '/'))
+  window.open(`/api/files/preview?path=${encodedPath}`, '_blank')
 }
 
-const handleRowClick = (row) => {
-  currentCommand.value = row
+// 修改文件加载逻辑
+const loadFileContent = async (filePath) => {
+  try {
+    const encodedPath = encodeURIComponent(filePath)
+    const res = await axios.get('/api/files/content', {
+      params: { path: encodedPath },
+      paramsSerializer: { indexes: null }
+    })
+    
+    // 更新路径处理逻辑
+    const realPath = res.data.file_path.replace(/\\/g, '/')
+    if (realPath !== filePath) {
+      ElMessage.warning('路径已自动校正')
+    }
+    
+    fileContent.value = res.data.content
+    lastSavedTime.value = res.data.timestamp
+    unsavedChanges.value = false
+
+  } catch (error) {
+    ElMessage.error(`文件加载失败: ${error.response?.data?.error || error.message}`)
+  }
 }
 
+// 文件编辑器切换
 const toggleFileEditor = async (row, filePath) => {
-  if (!filePath) {
-    ElMessage.warning('文件路径不存在')
+  if (!row || !filePath) {
+    ElMessage.warning('参数错误')
     return
   }
 
@@ -419,48 +466,63 @@ const toggleFileEditor = async (row, filePath) => {
   }
 
   try {
+    loading.value = true
     currentCommand.value = row
     currentFile.value = { path: filePath }
-    showFileEditor.value = true
     await loadFileContent(filePath)
+    showFileEditor.value = true
   } catch (error) {
     console.error('打开文件失败:', error)
     showFileEditor.value = false
     currentFile.value = null
+  } finally {
+    loading.value = false
   }
 }
 
-const loadFileContent = async (filePath) => {
-  try {
-    const res = await axios.get('/api/files/content', {
-      params: { 
-        path: filePath  // 不再使用encodeURIComponent，后端应能处理原始路径
-      }
-    });
-    
-    fileContent.value = res.data.content;
-    lastSavedTime.value = res.data.timestamp;
-    unsavedChanges.value = false;
-    
-    fileStatus.value = {
-      ...fileStatus.value,
-      [filePath]: {
-        type: 'success',
-        text: '加载成功'
-      }
-    };
-  } catch (error) {
-    fileStatus.value = {
-      ...fileStatus.value,
-      [filePath]: {
-        type: 'danger',
-        text: '加载失败'
-      }
-    };
-    throw error; // 抛出错误以便上层处理
+// 统一路径格式化方法
+const formatPath = (path) => {
+  if (!path) return ''
+  // 处理Windows路径
+  let formatted = path.replace(/\\/g, '/')
+  // 去除多余斜杠
+  formatted = formatted.replace(/\/+/g, '/')
+  // 处理相对路径
+  if (formatted.startsWith('./')) {
+    formatted = formatted.substring(2)
   }
+  return formatted
 }
 
+// 增强预览方法
+const previewMarkdown = (filePath) => {
+  if (!filePath) {
+    ElMessage.warning('文件路径未定义')
+    return
+  }
+  
+  const formattedPath = formatPath(filePath)
+  console.log('格式化路径:', formattedPath)
+  
+  // 编码处理
+  const encodedPath = encodeURIComponent(formattedPath)
+  const previewUrl = `/preview?path=${encodedPath}&t=${Date.now()}`
+  
+  // 检查文件有效性
+  axios.get(`/api/files/check?path=${encodedPath}`)
+    .then(res => {
+      if (res.data.exists && res.data.is_file) {
+        window.open(previewUrl, '_blank')
+      } else {
+        ElMessage.error('文件不存在或不是有效文件')
+      }
+    })
+    .catch(error => {
+      ElMessage.error(`路径检查失败: ${error.message}`)
+    })
+}
+
+// 修改保存逻辑适配新路径结构
 const saveFileContent = async (row, filePath) => {
   try {
     savingFile.value = true
@@ -469,26 +531,36 @@ const saveFileContent = async (row, filePath) => {
       content: fileContent.value
     })
     
-    lastSavedTime.value = res.data.timestamp
-    unsavedChanges.value = false
-    
-    // 更新关联命令的更新时间
-    const command = commandList.value.find(cmd => 
-      cmd.file_paths.some(f => f.path === filePath)
+    // 更新关联命令的路径信息
+    const updatedCommand = commandList.value.find(cmd => 
+      cmd.file_paths.some(f => f.full_path === filePath)
     )
-    if (command) {
-      command.updated_at = res.data.timestamp
+    if (updatedCommand) {
+      updatedCommand.updated_at = res.data.timestamp
     }
     
+    ElMessage.success({
+      message: `文件保存成功: ${getFileName(filePath)}`,
+      duration: 3000,
+      showClose: true
+    })
+    
+    // 更新文件状态
     fileStatus.value = {
       ...fileStatus.value,
       [filePath]: {
         type: 'success',
-        text: '保存成功'
+        text: '已保存'
       }
     }
-    ElMessage.success(`文件保存成功(${getFileName(filePath)})`)
+    
   } catch (error) {
+    ElMessage.error({
+      message: `保存失败: ${error.response?.data?.error || error.message}`,
+      duration: 5000,
+      showClose: true
+    })
+    
     fileStatus.value = {
       ...fileStatus.value,
       [filePath]: {
@@ -496,7 +568,6 @@ const saveFileContent = async (row, filePath) => {
         text: '保存失败'
       }
     }
-    ElMessage.error(`保存失败(${getFileName(filePath)}): ${error.message}`)
   } finally {
     savingFile.value = false
   }
@@ -532,14 +603,21 @@ const handleContentChange = () => {
   unsavedChanges.value = true
 }
 
-const previewFile = (filePath) => {
-  if (!filePath) return
-  window.open(filePath, '_blank')
+// 获取文件夹文件列表
+const getFolderFiles = (row) => {
+  return folderFiles.value[row.out_folder_path] || []
 }
 
+// 修改后的文件预览方法
+const previewFile = (file) => {
+  if (!file) return
+  const fullPath = `${file.out_folder_path}/${file.file_name}`
+  window.open(`/api/files/content?path=${encodeURIComponent(fullPath)}`)
+}
+
+// 修改文件路径获取方式
 const getFileName = (path) => {
-  if (!path) return ''
-  return path.split('\\').pop() || path.split('/').pop()
+  return path?.split(/[\\/]/).pop() || ''
 }
 
 const handleCreateCommand = () => {
@@ -626,6 +704,11 @@ const handleSizeChange = (size) => {
   fetchCommandList()
 }
 
+const handleSearch = () => {
+  pagination.current_page = 1
+  fetchCommandList()
+}
+
 const getCommandTypeStyle = (type) => {
   const typeMap = {
     CLP: 'success',
@@ -650,31 +733,44 @@ const formatDateTime = (isoString) => {
   })
 }
 
+// 增强智能体调用逻辑
 const callDifyAgent = async (row, filePath) => {
   try {
     callingAgent.value = true
+    currentCallingFile.value = filePath
     
-    // 获取文件内容
+    // 获取标准化后的文件内容
     const fileRes = await axios.get('/api/files/content', {
-      params: { path: filePath }
-    });
+      params: { path: encodeURIComponent(filePath) }
+    })
     
-    // 调用后端代理接口，传递文件内容
+    // 调用后端代理接口
     const res = await axios.post('/api/commands/call-dify-agent', {
       command_id: row.command_value,
-      two_dimensional_file: fileRes.data.content // 传递文件内容
-    });
+      two_dimensional_file: fileRes.data.content,
+      file_metadata: {
+        path: filePath,
+        folder: row.out_folder_path,
+        filename: getFileName(filePath)
+      }
+    })
     
-    // 处理返回结果
-    ElMessage.success('智能体调用成功')
-    console.log('Dify智能体返回结果:', res.data)
-    
+    // 处理响应结果
+    ElMessage.success('智能体处理完成')
+    console.log('Dify响应:', res.data)
   } catch (error) {
     ElMessage.error('调用智能体失败: ' + error.message)
     console.error('调用智能体失败:', error)
   } finally {
     callingAgent.value = false
+    currentCallingFile.value = null
   }
+}
+
+// 增强行点击处理
+const handleRowClick = (row) => {
+  currentCommand.value = row || null
+  showFileEditor.value = false
 }
 
 // 初始化加载
@@ -717,25 +813,31 @@ fetchCommandList()
   border-radius: 4px;
 }
 
-.path-header {
-  padding: 10px 15px;
-  background-color: #f5f7fa;
-  border-radius: 4px;
-  cursor: pointer;
+.path-list-header {
   display: flex;
   align-items: center;
+  margin-bottom: 15px;
+  padding: 10px;
+  background-color: #f8f9fa;
+}
+
+.path-item {
   margin-bottom: 10px;
 }
 
-.path-header:hover {
-  background-color: #ebedf0;
+.path-header {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  background-color: #f5f7fa;
+  border-radius: 4px;
+  cursor: pointer;
 }
 
-.path-text {
-  margin-left: 8px;
-  flex: 1;
-  font-family: monospace;
-  color: #409eff;
+.file-time {
+  margin-left: auto;
+  color: #909399;
+  font-size: 12px;
 }
 
 .rotate-icon {
@@ -801,3 +903,5 @@ fetchCommandList()
   line-height: 1.5;
 }
 </style>
+
+
