@@ -720,25 +720,19 @@ const callDifyAgentForTable = async (row) => {
   }
 }
 
-// 修改文件级智能体调用方法
+// 文件级智能体调用保持不变
 const callDifyAgent = async (file) => {
   try {
     callingAgent.value = true
     currentCallingFile.value = { path: file.full_path }
-    
-    // 新增流程ID生成逻辑
-    const pathParts = file.full_path.split(/[\\/]/).filter(p => p)
-    const parentFolder = pathParts[pathParts.length - 2] // 获取父文件夹名称
-    const flowId = parentFolder?.substring(0, 8) || 'default' // 截取前8位
     
     const fileRes = await axios.get('/api/files/content', {
       params: { path: encodeURIComponent(file.full_path) }
     })
     
     const res = await axios.post('/api/commands/call-dify-agent', {
-      command_id: file.command_value,
-      two_dimensional_file: fileRes.data.content,
-      Two_dimensional_flow_id: flowId  // 添加新参数
+      command_id: file.command_value,  // 使用文件所属命令的command_value
+      two_dimensional_file: fileRes.data.content
     })
     
     ElMessage.success('智能体处理完成')

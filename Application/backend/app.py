@@ -2,7 +2,7 @@ import os
 from flask import Flask, jsonify, request, send_from_directory, Response
 from flask_sqlalchemy import SQLAlchemy
 from sqlalchemy import text
-from datetime import datetime
+from datetime import datetime, timedelta
 import markdown
 import requests
 import logging
@@ -58,27 +58,23 @@ class CommandLog(db.Model):
 @app.route('/api/files/content', methods=['GET'])
 def get_file_content():
     """增强路径校验逻辑"""
-    file_path = request.args.get('path')
-    if not file_path:
-        return jsonify({"error": "需要提供path参数"}), 400
+    file_path = unquote(unquote(request.args.get('path', '')))
+    
+    # 保留原始路径格式
+    if file_path.startswith('//'):
+        normalized_path = file_path.replace('/', '\\')
+    else:
+        normalized_path = os.path.normpath(file_path)
+    
+    # 添加网络路径访问权限检查
+    if normalized_path.startswith('\\\\'):
+        if not os.path.exists(normalized_path):
+            return jsonify({
+                "error": "网络路径不可访问，请检查共享权限",
+                "path": normalized_path
+            }), 403
 
     try:
-        # 详细解码过程
-        decoded_path = unquote(file_path)
-        normalized_path = os.path.normpath(decoded_path)
-        
-        app.logger.debug(f"请求路径解码结果: {normalized_path}")
-
-        # 增强路径存在性检查
-        if not os.path.exists(normalized_path):
-            app.logger.error(f"路径不存在: {normalized_path}")
-            return jsonify({
-                "error": "文件不存在",
-                "request_path": file_path,
-                "decoded_path": decoded_path,
-                "normalized_path": normalized_path
-            }), 404
-
         # 检查文件类型
         if not os.path.isfile(normalized_path):
             return jsonify({"error": "请求路径不是文件"}), 400
@@ -216,29 +212,35 @@ def get_command_logs():
         return jsonify({"error": "Server error"}), 500
 
 @app.route('/api/commands', methods=['POST'])
-def create_command_log():
-    """创建命令日志"""
+def create_command():
+    data = request.json
+    command_value = data.get('CommandValue')
+    command_type = data.get('CommandType')
+    out_folder_path = data.get('OutFolderPath')
+    
+    # 创建文件夹
     try:
-        data = request.get_json()
-        # 添加路径标准化处理
-        out_folder = os.path.dirname(data.get('table_data_path', ''))
-        file_name = os.path.basename(data.get('table_data_path', ''))
+        os.makedirs(out_folder_path, exist_ok=True)
+    except Exception as e:
+        return jsonify({'error': f'创建文件夹失败: {str(e)}'}), 500
+    
+    # 保存到数据库
+    try:
+        # 生成默认文件名
+        default_file_name = f"{command_value}.md"
         
-        new_log = CommandLog(
-            CommandValue=data['command_value'],
-            CommandType=data['command_type'],
-            OutFolderPath=out_folder.replace('\\', '/'),  # 统一存储为斜杠
-            FileName=file_name
+        new_command = CommandLog(
+            CommandValue=command_value,
+            CommandType=command_type,
+            OutFolderPath=out_folder_path,
+            FileName=default_file_name  # 添加默认文件名
         )
-        
-        db.session.add(new_log)
+        db.session.add(new_command)
         db.session.commit()
-        
-        return jsonify(new_log.to_dict()), 201
+        return jsonify({'message': '命令创建成功'}), 201
     except Exception as e:
         db.session.rollback()
-        app.logger.error(f"Create failed: {str(e)}")
-        return jsonify({"error": "Server error"}), 500
+        return jsonify({'error': f'保存到数据库失败: {str(e)}'}), 500
 
 @app.route('/api/commands/<int:command_id>', methods=['GET'])
 def get_command_detail(command_id):
@@ -320,8 +322,9 @@ def call_dify_agent():
         app.logger.debug(f"Received raw request data: {data}")
         command_id = data.get('command_id')
         two_dimensional_file = data.get('two_dimensional_file')  # 直接获取文件内容
+        Two_dimensional_flow_id = data.get('Two_dimensional_flow_id')
 
-        app.logger.debug(f"Received request with Command_id: {command_id}, Two_Dimensional_File: {two_dimensional_file}")
+        app.logger.debug(f"Received request with Command_id: {command_id}, Two_Dimensional_File: {two_dimensional_file}，Two_dimensional_flow_id: {Two_dimensional_flow_id}")
 
         # 检查必要参数是否存在
         if not all([command_id, two_dimensional_file]):
@@ -336,9 +339,10 @@ def call_dify_agent():
         payload = {
             "inputs": {
                 "command_id": command_id,
-                "two_dimensional_file": two_dimensional_file  # 直接传递文件内容
+                "two_dimensional_file": two_dimensional_file,  # 直接传递文件内容
+                "Two_dimensional_flow_id": Two_dimensional_flow_id
             },
-            "query": f"请根据AS400命令{command_id}基于二维表{two_dimensional_file}生成AS400的检证用例,并封装成JAVA,最后基于封装后的JAVA代码生成Junit测试用例",
+            "query": f"请根据AS400命令{command_id}以及Two_dimensional_flow_id参数{Two_dimensional_flow_id}，调用“CMD_AS400_Java_Junit_Tool”工具基于二维表{two_dimensional_file}生成AS400的检证用例,并封装成JAVA,最后基于封装后的JAVA代码生成Junit测试用例",
             "response_mode": "streaming",
             "conversation_id": "",
             "user": "abc-123",
@@ -351,6 +355,24 @@ def call_dify_agent():
             response = requests.post(dify_url, json=payload, headers=headers)
             response.raise_for_status()
             app.logger.debug(f"Dify API response: {response.text}")
+
+            # 新增类型继承逻辑
+            original_command = CommandLog.query.filter(
+                CommandLog.CommandValue == command_id
+            ).order_by(CommandLog.CreatedAt.desc()).first()
+
+            if original_command:
+                # 更新最近10分钟内创建的UNKNOWN类型记录
+                CommandLog.query.filter(
+                    CommandLog.CommandValue == command_id,
+                    CommandLog.CommandType == 'UNKNOWN',
+                    CommandLog.CreatedAt > datetime.now() - timedelta(minutes=10)
+                ).update({
+                    CommandLog.CommandType: original_command.CommandType,
+                    CommandLog.OutFolderPath: original_command.OutFolderPath
+                }, synchronize_session=False)
+                db.session.commit()
+
             return jsonify(response.json()), 200
         except requests.exceptions.RequestException as e:
             app.logger.error(f"Dify API request failed: {str(e)}")
@@ -367,6 +389,7 @@ def get_command_files_by_folder(folder_path):
         decoded_path = unquote(folder_path)
         normalized_path = os.path.normpath(decoded_path)
         
+        # 查询数据库中的文件记录
         files = CommandLog.query.filter(
             CommandLog.OutFolderPath == normalized_path
         ).with_entities(
@@ -381,7 +404,7 @@ def get_command_files_by_folder(folder_path):
                 "id": file.ID,
                 "file_name": file.FileName,
                 "out_folder_path": file.OutFolderPath,
-                "full_path": f"{file.OutFolderPath}/{file.FileName}".replace('\\', '/'),
+                "full_path": f"{file.OutFolderPath}\\{file.FileName}",  # 使用反斜杠拼接路径
                 "created_at": file.CreatedAt.isoformat()
             } for file in files]
         })
@@ -439,20 +462,26 @@ def preview_markdown():
     
     try:
         # 路径解码与标准化
-        decoded_path = unquote(file_path)
+        decoded_path = unquote(unquote(file_path))  # 双重解码
         normalized_path = os.path.normpath(decoded_path)
-        absolute_path = os.path.abspath(normalized_path)
+        
+        app.logger.debug(f"请求路径: {file_path}")
+        app.logger.debug(f"解码后路径: {decoded_path}")
+        app.logger.debug(f"标准化路径: {normalized_path}")
         
         # 路径安全检查
-        if not os.path.exists(absolute_path):
+        if not os.path.exists(normalized_path):
+            app.logger.error(f"文件不存在: {normalized_path}")
             return jsonify({"error": "文件不存在"}), 404
-        if not os.path.isfile(absolute_path):
+        if not os.path.isfile(normalized_path):
+            app.logger.error(f"路径不是文件: {normalized_path}")
             return jsonify({"error": "路径不是文件"}), 400
-        if not absolute_path.lower().endswith('.md'):
+        if not normalized_path.lower().endswith('.md'):
+            app.logger.error(f"文件类型不支持: {normalized_path}")
             return jsonify({"error": "仅支持Markdown文件"}), 400
         
         # 读取文件内容
-        with open(absolute_path, 'rb') as f:
+        with open(normalized_path, 'rb') as f:
             raw_data = f.read()
             detected_encoding = chardet.detect(raw_data)['encoding']
             content = raw_data.decode(detected_encoding or 'utf-8')
@@ -473,12 +502,76 @@ def preview_markdown():
         """
         return Response(full_html, mimetype='text/html')
     except Exception as e:
-        app.logger.error(f"预览失败: {str(e)}")
-        return jsonify({"error": "文件预览失败"}), 500
+        app.logger.error(f"预览失败: {str(e)}", exc_info=True)
+        return jsonify({"error": f"文件预览失败: {str(e)}"}), 500
 
 @app.route('/static/<path:filename>')
 def static_files(filename):
     return send_from_directory(os.path.join(app.root_path, 'static'), filename)
+
+@app.route('/api/commands/call-dify-agent-for-table', methods=['POST'])
+def call_dify_agent_for_table():
+    try:
+        # 获取请求数据
+        data = request.get_json()
+        app.logger.debug(f"Received raw request data: {data}")
+        command_id = data.get('command_id')
+
+        app.logger.debug(f"Received request with Command_id: {command_id}")
+
+        # 检查必要参数是否存在
+        if not all([command_id]):
+            return jsonify({"error": "Missing required parameters"}), 400
+
+        # 调用 Dify 智能体 API
+        dify_url = 'http://192.168.9.177/v1/chat-messages'
+        headers = {
+            'Authorization': 'Bearer app-JmZSqTBiOxiXPG3W9q9DM5vI',
+            'Content-Type': 'application/json'
+        }
+        payload = {
+            "inputs": {
+                "Command_id": command_id
+            },
+            "query": f"请根据AS400命令{command_id}调用“Two_Dimensional_Tool”工具生成检证用例二维表",
+            "response_mode": "streaming",
+            "conversation_id": "",
+            "user": "abc-123",
+            "files": [],
+            "parent_message_id": None
+        }
+
+        try:
+            app.logger.debug(f"Calling Dify API with payload: {payload}")
+            response = requests.post(dify_url, json=payload, headers=headers)
+            response.raise_for_status()
+            app.logger.debug(f"Dify API response: {response.text}")
+
+            # 新增类型继承逻辑
+            original_command = CommandLog.query.filter(
+                CommandLog.CommandValue == command_id
+            ).order_by(CommandLog.CreatedAt.desc()).first()
+
+            if original_command:
+                # 更新最近10分钟内创建的UNKNOWN类型记录
+                CommandLog.query.filter(
+                    CommandLog.CommandValue == command_id,
+                    CommandLog.CommandType == 'UNKNOWN',
+                    CommandLog.CreatedAt > datetime.now() - timedelta(minutes=10)
+                ).update({
+                    CommandLog.CommandType: original_command.CommandType,
+                    CommandLog.OutFolderPath: original_command.OutFolderPath
+                }, synchronize_session=False)
+                db.session.commit()
+
+            return jsonify(response.json()), 200
+        except requests.exceptions.RequestException as e:
+            app.logger.error(f"Dify API request failed: {str(e)}")
+            return jsonify({"error": f"Dify API request failed: {str(e)}"}), 500
+
+    except Exception as e:
+        app.logger.error(f"Failed to call Dify agent for table: {str(e)}")
+        return jsonify({"error": f"Failed to call Dify agent for table: {str(e)}"}), 500
 
 if __name__ == '__main__':
     with app.app_context():

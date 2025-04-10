@@ -322,9 +322,8 @@ def call_dify_agent():
         app.logger.debug(f"Received raw request data: {data}")
         command_id = data.get('command_id')
         two_dimensional_file = data.get('two_dimensional_file')  # 直接获取文件内容
-        Two_dimensional_flow_id = data.get('Two_dimensional_flow_id')
 
-        app.logger.debug(f"Received request with Command_id: {command_id}, Two_Dimensional_File: {two_dimensional_file}，Two_dimensional_flow_id: {Two_dimensional_flow_id}")
+        app.logger.debug(f"Received request with Command_id: {command_id}, Two_Dimensional_File: {two_dimensional_file}")
 
         # 检查必要参数是否存在
         if not all([command_id, two_dimensional_file]):
@@ -339,10 +338,9 @@ def call_dify_agent():
         payload = {
             "inputs": {
                 "command_id": command_id,
-                "two_dimensional_file": two_dimensional_file,  # 直接传递文件内容
-                "Two_dimensional_flow_id": Two_dimensional_flow_id
+                "two_dimensional_file": two_dimensional_file  # 直接传递文件内容
             },
-            "query": f"请根据AS400命令{command_id}以及Two_dimensional_flow_id参数{Two_dimensional_flow_id}，基于二维表{two_dimensional_file}生成AS400的检证用例,并封装成JAVA,最后基于封装后的JAVA代码生成Junit测试用例",
+            "query": f"请根据AS400命令{command_id}基于二维表{two_dimensional_file}生成AS400的检证用例,并封装成JAVA,最后基于封装后的JAVA代码生成Junit测试用例",
             "response_mode": "streaming",
             "conversation_id": "",
             "user": "abc-123",
